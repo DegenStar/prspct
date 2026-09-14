@@ -1,0 +1,12 @@
+# PRSPCT miner — Python orchestration layer.
+#
+# web3 7.x requires eth-account>=0.13.6. An older eth-account on the same
+# interpreter breaks startup with:
+#   ImportError: cannot import name 'SignedSetCodeAuthorization' from 'eth_account.datastructures'
+web3>=7.0,<8.0
+eth-account>=0.13.6
+requests>=2.31
+
+# Optional: lets prspct_miner.py auto-load a .env file. Without it you can still
+# run the miner as long as the variables are exported in the shell.
+python-dotenv>=1.0

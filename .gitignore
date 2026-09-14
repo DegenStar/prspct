@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+
+# holds MINER_PRIVATE_KEY — never commit
+.env
+.env.*
+!.env.example
+
+# compiled CUDA miner
+prspct_cuda
+*.o
+*.so
+
+.venv/
+venv/

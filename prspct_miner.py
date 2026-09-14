@@ -8,6 +8,10 @@ ENV:
   RPC_URLS           comma-separated RPC endpoints (default: 3 public RH mainnet nodes)
   CUDA_BIN           path to compiled miner (default: ./prspct_cuda)
   REFRESH_SEC        state polling period (default: 0.5)
+  MIN_TIP_WEI        maxPriorityFeePerGas in wei (default: 0 = pure sweat)
+
+All of the above may also live in a .env file next to this script; variables
+already exported in the shell take precedence over the file.
 """
 
 import os
@@ -22,6 +26,19 @@ import requests
 from eth_account import Account
 from web3 import Web3
 
+# ---------------- .env auto-load ----------------
+# Shell environment wins over the file (python-dotenv defaults to override=False),
+# so `MINER_PRIVATE_KEY=0x... python3 prspct_miner.py` still overrides .env.
+_ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    if os.path.exists(_ENV_FILE):
+        print(f"[WARN] found {_ENV_FILE} but python-dotenv is not installed — "
+              f"`pip install -r requirements.txt`, or export the variables manually")
+else:
+    load_dotenv(_ENV_FILE)
+
 PRIVATE_KEY = os.environ.get("MINER_PRIVATE_KEY", "").strip()
 
 DEFAULT_RPCS = ",".join([
@@ -30,10 +47,19 @@ DEFAULT_RPCS = ",".join([
     "https://rpc.ordofi.network",
 ])
 RPC_URLS = [u.strip() for u in os.environ.get("RPC_URLS", DEFAULT_RPCS).split(",") if u.strip()]
+if not RPC_URLS:  # e.g. a blank `RPC_URLS=` line in .env
+    RPC_URLS = [u.strip() for u in DEFAULT_RPCS.split(",") if u.strip()]
 random.shuffle(RPC_URLS)
 
 CUDA_BIN = os.environ.get("CUDA_BIN", "./prspct_cuda")
 REFRESH_SEC = float(os.environ.get("REFRESH_SEC", "0.5"))
+
+# maxPriorityFeePerGas in wei. Default 0 = pure sweat. Raise it only if your RPC
+# rejects 0-tip txs ("transaction underpriced" / "tip too low").
+_tip = os.environ.get("MIN_TIP_WEI", "0").strip()
+MIN_TIP_WEI = int(_tip) if _tip.isdigit() else 0
+if not _tip.isdigit():
+    print(f"MIN_TIP_WEI={_tip!r} is not a decimal number — using 0 (pure sweat)")
 
 CHAIN_ID = 4663
 CONTRACT = "0xd078008c3D887A52CE722A3cA0539cA1F4971dD1"
@@ -147,6 +173,11 @@ def read_state():
     # Each field is 32 bytes in the ABI-encoded tuple.
     s = res[0][2:]  # strip 0x
 
+    # Fail loudly on ABI drift: a short tuple would silently shift every index
+    # below and we would mine against a bogus target forever.
+    if len(s) % 64 or len(s) // 64 < 14:
+        raise RuntimeError(f"state() ABI drift: got {len(s)} hex chars, expected >= 14 words")
+
     def word(n):
         return s[n * 64:(n + 1) * 64]
 
@@ -179,14 +210,31 @@ def get_balance():
 
 
 TX_NONCE = None
+TX_NONCE_LOCK = threading.Lock()
 GAS_LIMIT = 500_000
+
+
+def _read_pending_nonce():
+    res = rpc.call_with_retry([("eth_getTransactionCount", [ADDR, "pending"])])
+    return int(res[0], 16)
 
 
 def refresh_tx_nonce():
     global TX_NONCE
-    res = rpc.call_with_retry([("eth_getTransactionCount", [ADDR, "pending"])])
-    TX_NONCE = int(res[0], 16)
-    return TX_NONCE
+    with TX_NONCE_LOCK:
+        TX_NONCE = _read_pending_nonce()
+        return TX_NONCE
+
+
+def reserve_tx_nonce():
+    """Atomically claim the next nonce — concurrent FOUND workers must not collide."""
+    global TX_NONCE
+    with TX_NONCE_LOCK:
+        if TX_NONCE is None:
+            TX_NONCE = _read_pending_nonce()
+        n = TX_NONCE
+        TX_NONCE += 1
+        return n
 
 
 def _broadcast(raw_hex):
@@ -217,38 +265,39 @@ def _broadcast(raw_hex):
 
 def submit(nonce: int, st: dict):
     """Python fallback: send claim(nonce) with value=0 (pure sweat)."""
-    global TX_NONCE
-    if TX_NONCE is None:
-        refresh_tx_nonce()
-
     w3 = w3_for(rpc.url)
     c = w3.eth.contract(address=Web3.to_checksum_address(CONTRACT), abi=ABI)
     data = c.encode_abi("claim", args=[nonce]) if hasattr(c, "encode_abi") else \
            c.encodeABI(fn_name="claim", args=[nonce])
 
     for attempt in range(3):
+        tx_nonce = reserve_tx_nonce()
         tx = {
             "to": Web3.to_checksum_address(CONTRACT), "from": ADDR,
             "value": 0,  # pure sweat
-            "data": data, "chainId": CHAIN_ID, "nonce": TX_NONCE, "gas": GAS_LIMIT,
+            "data": data, "chainId": CHAIN_ID, "nonce": tx_nonce, "gas": GAS_LIMIT,
             "maxFeePerGas": max(int(st.get("gas_price", 0) * 2), Web3.to_wei(1, "gwei")),
-            "maxPriorityFeePerGas": 0,
+            "maxPriorityFeePerGas": MIN_TIP_WEI,
             "type": 2,
         }
         signed = acct.sign_transaction(tx)
         raw_hex = "0x" + signed.raw_transaction.hex().replace("0x", "")
         try:
             h, via = _broadcast(raw_hex)
-            TX_NONCE += 1
-            log(f"[TX] sent {h} nonce={tx['nonce']} via {via.split('//')[-1][:24]}")
+            log(f"[TX] sent {h} nonce={tx_nonce} via {via.split('//')[-1][:24]}")
             rc = w3.eth.wait_for_transaction_receipt(h, timeout=180)
             log(f"[TX] status={rc['status']} block={rc['blockNumber']} gasUsed={rc['gasUsed']}")
             return rc["status"] == 1
         except Exception as e:
             msg = str(e).lower()
-            if "nonce" in msg or "already known" in msg or "replacement" in msg:
-                log(f"[TX] nonce issue ({str(e)[:60]}) — re-reading and retrying")
+            # Any failure may mean our local nonce drifted from the chain
+            # (tx rejected, node timed out, or it landed despite the error).
+            log(f"[TX] nonce={tx_nonce} failed ({str(e)[:80]}) — resyncing nonce")
+            try:
                 refresh_tx_nonce()
+            except Exception as re_:
+                log(f"[WARN] nonce resync failed: {str(re_)[:60]}")
+            if "nonce" in msg or "already known" in msg or "replacement" in msg:
                 continue
             raise
     raise RuntimeError("failed to send: nonce conflict 3x in a row")

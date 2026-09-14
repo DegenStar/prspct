@@ -84,6 +84,11 @@ static void init_native() {
   if (g_rpcs.empty()) split_csv(
     "https://rpc.mainnet.chain.robinhood.com,https://robinhood-rpc.publicnode.com,"
     "https://rpc.ordofi.network", g_rpcs);
+  if (const char *tip = getenv("MIN_TIP_WEI")) {
+    std::string t = tip;
+    if (!t.empty() && t.find_first_not_of("0123456789") == std::string::npos) g_tx.tip_wei = t;
+    else out("INFO MIN_TIP_WEI ignored (not a decimal number)\n");
+  }
   curl_global_init(CURL_GLOBAL_DEFAULT);
   pr::unhex("0xd078008c3D887A52CE722A3cA0539cA1F4971dD1", g_tx.to);
   g_native = true;

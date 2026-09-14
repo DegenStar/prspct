@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include <thread>
@@ -98,7 +99,10 @@ static bytes dec_to_be(const std::string &dec) {
   return bytes(v.rbegin(), v.rend());
 }
 static bytes u64_to_be(uint64_t x) { bytes v; while (x) { v.insert(v.begin(), (uint8_t)x); x >>= 8; } return v; }
-static bytes pad32(const bytes &v) { bytes o(32, 0); if (v.size() <= 32) memcpy(o.data() + 32 - v.size(), v.data(), v.size()); return o; }
+static bytes pad32(const bytes &v) {
+  if (v.size() > 32) { fprintf(stderr, "pad32: value wider than 32 bytes (%zu)\n", v.size()); abort(); }
+  bytes o(32, 0); memcpy(o.data() + 32 - v.size(), v.data(), v.size()); return o;
+}
 
 // ---------------- RLP ----------------
 static bytes rlp_len(size_t n, uint8_t base) {
@@ -154,6 +158,7 @@ struct TxParams {
   bytes to;
   uint64_t tx_nonce = 0;
   std::string max_fee_wei;
+  std::string tip_wei = "0";       // maxPriorityFeePerGas; 0 = pure sweat
   uint64_t gas_limit = 500000;
 };
 
@@ -173,7 +178,7 @@ static bool build_claim_tx(const Wallet &w, const TxParams &p, uint64_t nonce, b
   std::vector<bytes> f = {
     rlp_bytes(u64_to_be(p.chain_id)),
     rlp_bytes(u64_to_be(p.tx_nonce)),
-    rlp_bytes(bytes()),                        // maxPriorityFeePerGas = 0
+    rlp_bytes(dec_to_be(p.tip_wei)),           // maxPriorityFeePerGas (0 = pure sweat)
     rlp_bytes(dec_to_be(p.max_fee_wei)),
     rlp_bytes(u64_to_be(p.gas_limit)),
     rlp_bytes(p.to),
