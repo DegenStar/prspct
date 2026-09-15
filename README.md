@@ -1,4 +1,4 @@
-﻿# PRSPCT 挖矿器
+﻿# ⛏️ PRSPCT 挖矿器
 
 PRSPCT 挖矿器在 Robinhood Chain 主网（Chain ID `4663`）上搜索满足链上 `target` 的 nonce，并提交 `claim(nonce)` 交易。
 
@@ -15,7 +15,7 @@ PRSPCT 挖矿器在 Robinhood Chain 主网（Chain ID `4663`）上搜索满足�
 
 不同系统的安装、编译、配置和启动步骤请参阅：
 
-[安装使用指南.md](安装使用指南.md)
+📖 [安装使用指南.md](安装使用指南.md)
 
 指南覆盖以下环境：
 
