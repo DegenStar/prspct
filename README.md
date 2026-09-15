@@ -60,5 +60,4 @@ keccak256(abi.encodePacked(bytes32 seed, address sender, uint256 nonce)) < targe
 ## 相关链接
 
 - 官网：https://prspct.xyz
-- X：
 - OpenSea：https://opensea.io/collection/prspct
