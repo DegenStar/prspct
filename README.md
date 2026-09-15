@@ -2,6 +2,8 @@
 
 PRSPCT 挖矿器在 Robinhood Chain 主网（Chain ID `4663`）上搜索满足链上 `target` 的 nonce，并提交 `claim(nonce)` 交易。
 
+- 项目官网：🔗 https://prspct.xyz
+
 ## 功能
 
 - 使用 Keccak-256 计算 `seed + sender + nonce` 哈希。
@@ -15,7 +17,7 @@ PRSPCT 挖矿器在 Robinhood Chain 主网（Chain ID `4663`）上搜索满足�
 
 不同系统的安装、编译、配置和启动步骤请参阅：
 
-📖 [安装使用指南.md](安装使用指南.md)
+📖 [安装使用指南.md](Installation-Guide.md)
 
 指南覆盖以下环境：
 
@@ -58,5 +60,5 @@ keccak256(abi.encodePacked(bytes32 seed, address sender, uint256 nonce)) < targe
 ## 相关链接
 
 - 官网：https://prspct.xyz
+- X：
 - OpenSea：https://opensea.io/collection/prspct
-- GitHub：https://github.com/DegenStar/prspct

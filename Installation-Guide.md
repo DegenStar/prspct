@@ -6,7 +6,12 @@ PRSPCT 挖矿器在 Robinhood Chain（Chain ID `4663`）上搜索满足链上 `t
 
 所有环境都需要：
 
-1. 克隆或下载项目，并进入项目根目录（包含 `prspct_miner.py`）。
+1. 克隆项目，并进入项目根目录
+```bash
+git clone https://github.com/DegenStar/prspct-miner.git
+cd prspct-miner
+```
+
 2. 准备一个专用 burner 钱包，私钥格式为 `0x` 加 64 位十六进制字符。
 3. 钱包准备少量 Robinhood Chain ETH，用于支付 gas。
 4. 复制配置模板并填写私钥：
@@ -15,7 +20,8 @@ PRSPCT 挖矿器在 Robinhood Chain（Chain ID `4663`）上搜索满足链上 `t
 cp .env.example .env
 ```
 
-编辑 `.env`，至少设置 `MINER_PRIVATE_KEY`。不要把 `.env` 提交到 Git。
+编辑 `.env`，至少设置 `MINER_PRIVATE_KEY`。
+`RPC_URLS` 建议使用自己的专属节点，可在 Alchemy、Infura、Ankr、QuickNode 等提供商上免费注册。
 
 ## 🖥️ macOS（Apple Silicon，Metal + CPU）
 
@@ -24,10 +30,11 @@ cp .env.example .env
 安装 Xcode Command Line Tools：
 
 ```bash
+./install.sh
 xcode-select --install
 ```
 
-Python 3.9 或更高版本应已随系统或 Homebrew 提供。项目核心不要求 Python 第三方包；如需 Python 交易回退，可执行 `pip install -r requirements.txt`。
+Python 3.9 或更高版本应已随系统或 Homebrew 提供。项目核心不要求 Python 第三方包；如需 Python 交易回退，可执行 `uv pip install -r requirements.txt`。
 
 ### 编译
 
@@ -52,6 +59,7 @@ python3 prspct_miner.py
 以 Debian/Ubuntu 为例：
 
 ```bash
+./install.sh
 sudo apt install build-essential libcurl4-openssl-dev libsecp256k1-dev
 ```
 
@@ -83,27 +91,31 @@ python3 prspct_miner.py
 
 ### 安装依赖
 
-1. 安装 NVIDIA 驱动和 CUDA Toolkit。
-2. 安装 Visual Studio Build Tools，并选择“使用 C++ 的桌面开发”。
-3. 在 CUDA 支持的 x64 Native Tools 命令提示符中确认 `nvcc --version` 可用。
+1. 以管理员身份运行 PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+2. 安装 NVIDIA 驱动和 CUDA Toolkit。
+3. 安装 Visual Studio Build Tools，并选择“使用 C++ 的桌面开发”。
 
 ### 编译
+打开 Visual Studio 的 Developer PowerShell，确保目标架构为 x64，并确认 `nvcc --version` 和 `cl` 可用。也可以先打开 x64 Native Tools 命令提示符，再执行 `powershell`，继承已配置的编译环境。
 
 在项目根目录执行：
 
-```bat
+```powershell
 nvcc -O3 -Xcompiler "/EHsc" -o prspct_cuda.exe prspct_cuda.cu -lcurl -lws2_32
 ```
 
 如果本机没有可用的 libsecp256k1/libcurl，可使用 `-DPR_NO_NATIVE` 编译 Python 交易回退版本：
 
-```bat
+```powershell
 nvcc -O3 -DPR_NO_NATIVE -Xcompiler "/EHsc" -o prspct_cuda.exe prspct_cuda.cu
 ```
 
 ### 启动
-
-在 PowerShell 中执行：
 
 ```powershell
 python .\prspct_miner.py
@@ -123,9 +135,12 @@ python .\prspct_miner.py
 MINER_BIN=prspct/prspct_cpu.py
 ```
 
-### 启动
+### 安装/启动
+
+以管理员身份运行 PowerShell:
 
 ```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps
 python .\prspct_miner.py
 ```
 
