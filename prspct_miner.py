@@ -1,17 +1,23 @@
-"""
-PRSPCT native GPU miner — orchestrator.
-Runs ./prspct_cuda (CUDA keccak-256), watches contract state (seed/target/price),
-feeds current job to the miner, and lets the native binary sign+broadcast claim(nonce).
+﻿"""
+PRSPCT native miner 鈥?orchestrator.
+Runs the keccak-256 miner binary (CUDA on Linux/NVIDIA, Metal+CPU on macOS),
+watches contract state (seed/target/price), feeds it the current job, and lets
+the native binary sign+broadcast claim(nonce).
 
 ENV:
   MINER_PRIVATE_KEY  0x... burner wallet private key (required)
   RPC_URLS           comma-separated RPC endpoints (default: 3 public RH mainnet nodes)
-  CUDA_BIN           path to compiled miner (default: ./prspct_cuda)
+  MINER_BIN          path to compiled miner (default: ./prspct_local, then ./prspct_cuda)
+  CUDA_BIN           legacy alias for MINER_BIN (still honoured)
   REFRESH_SEC        state polling period (default: 0.5)
   MIN_TIP_WEI        maxPriorityFeePerGas in wei (default: 0 = pure sweat)
 
 All of the above may also live in a .env file next to this script; variables
 already exported in the shell take precedence over the file.
+
+Only the standard library is required: web3/requests are used when installed but
+are optional. Without eth-account the Python tx fallback is unavailable 鈥?that is
+fine, the miner binary signs and broadcasts natively.
 """
 
 import os
@@ -20,11 +26,23 @@ import subprocess
 import sys
 import threading
 import time
+import json
+import urllib.error
+import urllib.request
 from queue import Queue, Empty
 
-import requests
-from eth_account import Account
-from web3 import Web3
+from prspct_keccak import keccak256
+from prspct_eth import privkey_to_address, to_checksum_address
+
+try:                      # optional: connection pooling + keep-alive
+    import requests
+except ImportError:
+    requests = None
+
+try:                      # optional: only the Python submit fallback needs it
+    from eth_account import Account
+except ImportError:
+    Account = None
 
 # ---------------- .env auto-load ----------------
 # Shell environment wins over the file (python-dotenv defaults to override=False),
@@ -33,9 +51,25 @@ _ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 try:
     from dotenv import load_dotenv
 except ImportError:
-    if os.path.exists(_ENV_FILE):
-        print(f"[WARN] found {_ENV_FILE} but python-dotenv is not installed — "
-              f"`pip install -r requirements.txt`, or export the variables manually")
+    def _load_env_file(path):
+        """Tiny stdlib .env reader so the documented workflow works without deps."""
+        if not os.path.exists(path):
+            return
+        with open(path, "r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[7:].lstrip()
+                if "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key, val = key.strip(), val.strip()
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in "'\"":
+                    val = val[1:-1]
+                os.environ.setdefault(key, val)   # shell env still wins
+    _load_env_file(_ENV_FILE)
 else:
     load_dotenv(_ENV_FILE)
 
@@ -51,7 +85,25 @@ if not RPC_URLS:  # e.g. a blank `RPC_URLS=` line in .env
     RPC_URLS = [u.strip() for u in DEFAULT_RPCS.split(",") if u.strip()]
 random.shuffle(RPC_URLS)
 
-CUDA_BIN = os.environ.get("CUDA_BIN", "./prspct_cuda")
+# Miner binary: MINER_BIN wins, CUDA_BIN is the legacy name, otherwise pick the
+# first build that exists next to this script (local build first).
+_here = os.path.dirname(os.path.abspath(__file__))
+MINER_BIN = os.environ.get("MINER_BIN") or os.environ.get("CUDA_BIN")
+if not MINER_BIN:
+    # Windows toolchains emit .exe files; keep extensionless Unix names too.
+    candidates = ("prspct_local", "prspct_cuda", os.path.join("prspct", "prspct_cpu.py"))
+    for cand in candidates:
+        for name in (cand, cand + ".exe"):
+            p = os.path.join(_here, name)
+            if os.path.exists(p):
+                MINER_BIN = p
+                break
+        if MINER_BIN:
+            break
+    else:
+        # Keep a deterministic default even before the first build exists.
+        MINER_BIN = os.path.join(_here, "prspct_local" + (".exe" if os.name == "nt" else ""))
+CUDA_BIN = MINER_BIN          # kept for the rest of the file
 REFRESH_SEC = float(os.environ.get("REFRESH_SEC", "0.5"))
 
 # maxPriorityFeePerGas in wei. Default 0 = pure sweat. Raise it only if your RPC
@@ -59,31 +111,31 @@ REFRESH_SEC = float(os.environ.get("REFRESH_SEC", "0.5"))
 _tip = os.environ.get("MIN_TIP_WEI", "0").strip()
 MIN_TIP_WEI = int(_tip) if _tip.isdigit() else 0
 if not _tip.isdigit():
-    print(f"MIN_TIP_WEI={_tip!r} is not a decimal number — using 0 (pure sweat)")
+    print(f"MIN_TIP_WEI={_tip!r} is not a decimal number 鈥?using 0 (pure sweat)")
 
 CHAIN_ID = 4663
 CONTRACT = "0xd078008c3D887A52CE722A3cA0539cA1F4971dD1"
+GWEI = 10 ** 9
 
 # Selectors (verified against PRSPCT_ABI)
 SEL_SEED   = "0x04f10a2c"   # keccak("seed()")[:4]
-SEL_TARGET = "0xc7f758a8"   # keccak("targetOf(uint256,uint256)")[:4]  — targetOf(0, 0) = pure sweat target
+SEL_TARGET = "0xc7f758a8"   # keccak("targetOf(uint256,uint256)")[:4]  鈥?targetOf(0, 0) = pure sweat target
 SEL_DEPTH  = "0x0568a5b1"   # keccak("depth()")[:4]
-SEL_PRICE  = "0x6817c76c"   # keccak("priceOf(uint256)")[:4]  — priceOf(1) for sanity
+SEL_PRICE  = "0x6817c76c"   # keccak("priceOf(uint256)")[:4]  鈥?priceOf(1) for sanity
 SEL_STATE  = "0xc19d93fb"   # keccak("state()")[:4]
-
-ABI = [
-    {"type": "function", "name": "claim",
-     "inputs": [{"name": "nonce", "type": "uint256"}],
-     "outputs": [{"name": "tokenId", "type": "uint256"}],
-     "stateMutability": "payable"},
-]
 
 if not (PRIVATE_KEY.startswith("0x") and len(PRIVATE_KEY) == 66):
     print("MINER_PRIVATE_KEY not set or invalid (need 0x + 64 hex)")
     sys.exit(1)
 
-acct = Account.from_key(PRIVATE_KEY)
-ADDR = acct.address
+if Account is not None:
+    acct = Account.from_key(PRIVATE_KEY)
+    ADDR = acct.address
+else:
+    # No eth-account installed: derive the address ourselves. Native tx-mode
+    # (the default) signs inside the miner binary, so this is all we need.
+    acct = None
+    ADDR = privkey_to_address(PRIVATE_KEY)
 
 
 def log(*a):
@@ -91,12 +143,43 @@ def log(*a):
 
 
 # ---------------- RPC with rotation + backoff ----------------
+class _Resp:
+    """Minimal stand-in for a requests.Response (urllib fallback)."""
+    def __init__(self, status, body):
+        self.status_code = status
+        self._body = body
+
+    def json(self):
+        return json.loads(self._body)
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}: {self._body[:120]}")
+
+
+class _UrllibSession:
+    """Same tiny surface as requests.Session, backed by urllib (stdlib only)."""
+    def post(self, url, timeout=15, **kw):
+        body = json.dumps(kw.get("json")).encode()
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json",
+                                                             "User-Agent": "prspct-miner/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return _Resp(r.status, r.read().decode())
+        except urllib.error.HTTPError as e:
+            return _Resp(e.code, e.read().decode() or str(e))
+
+
+def _new_session():
+    return requests.Session() if requests is not None else _UrllibSession()
+
+
 class Rpc:
     def __init__(self, urls):
         self.urls = urls
         self.i = random.randrange(len(urls))
         self.backoff = 0.0
-        self.sess = requests.Session()
+        self.sess = _new_session()
 
     @property
     def url(self):
@@ -146,8 +229,15 @@ class Rpc:
 rpc = Rpc(RPC_URLS)
 
 
-def w3_for(url):
-    return Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 30}))
+def wait_receipt(tx_hash, timeout=180):
+    """Poll eth_getTransactionReceipt until mined (or timeout)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        res = rpc.call_with_retry([("eth_getTransactionReceipt", [tx_hash])], attempts=3)
+        if res[0]:
+            return res[0]
+        time.sleep(1.0)
+    raise TimeoutError(f"no receipt for {tx_hash} within {timeout}s")
 
 
 def bits_of(target: int) -> int:
@@ -157,7 +247,7 @@ def bits_of(target: int) -> int:
 def local_hash(seed: bytes, sender_hex: str, nonce: int) -> int:
     """Match the on-chain keccak256(abi.encodePacked(seed, sender, nonce)) hash."""
     data = seed + bytes.fromhex(sender_hex[2:]) + nonce.to_bytes(32, "big")
-    return int.from_bytes(Web3.keccak(data), "big")
+    return int.from_bytes(keccak256(data), "big")
 
 
 def read_state():
@@ -227,7 +317,7 @@ def refresh_tx_nonce():
 
 
 def reserve_tx_nonce():
-    """Atomically claim the next nonce — concurrent FOUND workers must not collide."""
+    """Atomically claim the next nonce 鈥?concurrent FOUND workers must not collide."""
     global TX_NONCE
     with TX_NONCE_LOCK:
         if TX_NONCE is None:
@@ -238,13 +328,13 @@ def reserve_tx_nonce():
 
 
 def _broadcast(raw_hex):
-    """Fire raw tx at all RPCs in parallel — whoever's first wins."""
+    """Fire raw tx at all RPCs in parallel 鈥?whoever's first wins."""
     import concurrent.futures as _cf
     errs = []
 
     def send(u):
-        r = requests.post(u, json={"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction",
-                                    "params": [raw_hex]}, timeout=8)
+        r = _new_session().post(u, json={"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction",
+                                         "params": [raw_hex]}, timeout=8)
         j = r.json()
         if j.get("result"):
             return (j["result"], u)
@@ -259,24 +349,29 @@ def _broadcast(raw_hex):
                 errs.append(str(e))
     for e in errs:
         if "already known" in e.lower() or "known transaction" in e.lower():
-            return ("0x" + Web3.keccak(hexstr=raw_hex).hex().replace("0x", ""), "already-known")
+            return ("0x" + keccak256(bytes.fromhex(raw_hex[2:])).hex(), "already-known")
     raise RuntimeError("; ".join(errs)[:150])
+
+
+# claim(uint256) calldata: selector + 32-byte nonce (identical to the C++ side)
+SEL_CLAIM = keccak256(b"claim(uint256)")[:4]
+CONTRACT_ADDR = to_checksum_address(CONTRACT)
 
 
 def submit(nonce: int, st: dict):
     """Python fallback: send claim(nonce) with value=0 (pure sweat)."""
-    w3 = w3_for(rpc.url)
-    c = w3.eth.contract(address=Web3.to_checksum_address(CONTRACT), abi=ABI)
-    data = c.encode_abi("claim", args=[nonce]) if hasattr(c, "encode_abi") else \
-           c.encodeABI(fn_name="claim", args=[nonce])
+    if acct is None:
+        raise RuntimeError("Python submit needs eth-account 鈥?run `pip install -r requirements.txt` "
+                           "or rely on native tx-mode (the miner binary signs the claim itself)")
+    data = SEL_CLAIM + nonce.to_bytes(32, "big")
 
     for attempt in range(3):
         tx_nonce = reserve_tx_nonce()
         tx = {
-            "to": Web3.to_checksum_address(CONTRACT), "from": ADDR,
+            "to": CONTRACT_ADDR, "from": ADDR,
             "value": 0,  # pure sweat
             "data": data, "chainId": CHAIN_ID, "nonce": tx_nonce, "gas": GAS_LIMIT,
-            "maxFeePerGas": max(int(st.get("gas_price", 0) * 2), Web3.to_wei(1, "gwei")),
+            "maxFeePerGas": max(int(st.get("gas_price", 0) * 2), GWEI),
             "maxPriorityFeePerGas": MIN_TIP_WEI,
             "type": 2,
         }
@@ -285,14 +380,14 @@ def submit(nonce: int, st: dict):
         try:
             h, via = _broadcast(raw_hex)
             log(f"[TX] sent {h} nonce={tx_nonce} via {via.split('//')[-1][:24]}")
-            rc = w3.eth.wait_for_transaction_receipt(h, timeout=180)
+            rc = wait_receipt(h, timeout=180)
             log(f"[TX] status={rc['status']} block={rc['blockNumber']} gasUsed={rc['gasUsed']}")
-            return rc["status"] == 1
+            return int(rc["status"], 16) == 1 if isinstance(rc["status"], str) else rc["status"] == 1
         except Exception as e:
             msg = str(e).lower()
             # Any failure may mean our local nonce drifted from the chain
             # (tx rejected, node timed out, or it landed despite the error).
-            log(f"[TX] nonce={tx_nonce} failed ({str(e)[:80]}) — resyncing nonce")
+            log(f"[TX] nonce={tx_nonce} failed ({str(e)[:80]}) 鈥?resyncing nonce")
             try:
                 refresh_tx_nonce()
             except Exception as re_:
@@ -303,8 +398,8 @@ def submit(nonce: int, st: dict):
     raise RuntimeError("failed to send: nonce conflict 3x in a row")
 
 
-# ---------------- CUDA process ----------------
-class Cuda:
+# ---------------- miner process (CUDA or local Metal/CPU build) ----------------
+class Miner:
     def __init__(self):
         self.proc = None
         self.q: Queue = Queue()
@@ -312,10 +407,11 @@ class Cuda:
 
     def start(self):
         env = dict(os.environ, MINER_PRIVATE_KEY=PRIVATE_KEY, RPC_URLS=",".join(RPC_URLS))
-        self.proc = subprocess.Popen([CUDA_BIN], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        command = [sys.executable, CUDA_BIN] if CUDA_BIN.lower().endswith('.py') else [CUDA_BIN]
+        self.proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                       stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
         threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()
-        log(f"[cuda] started pid={self.proc.pid}")
+        log(f"[miner] started {os.path.basename(CUDA_BIN)} pid={self.proc.pid}")
 
     def _reader(self, proc):
         for line in proc.stdout:
@@ -327,7 +423,7 @@ class Cuda:
             self.proc.stdin.write(line + "\n")
             self.proc.stdin.flush()
         except Exception as e:
-            log(f"[cuda] write failed: {e}")
+            log(f"[miner] write failed: {e}")
 
     def restart(self):
         try:
@@ -339,21 +435,23 @@ class Cuda:
 
 
 def main():
-    log(f"[*] miner {ADDR} rpc={RPC_URLS}")
+    log(f"[*] miner {ADDR}")
+    log(f"[*] binary {CUDA_BIN} rpc={RPC_URLS}")
 
     for n in range(20):
         try:
             bal = get_balance()
             log(f"[*] balance={bal/1e18:.5f} ETH")
             if bal < 0.001e18:
-                log("[!] wallet has less than 0.001 ETH — claims will fail on gas, top up")
+                log("[!] wallet has less than 0.001 ETH 鈥?claims will fail on gas, top up")
             break
         except Exception as e:
             log(f"[WARN] balance read failed ({str(e)[:60]}), retry {n+1}/20")
             time.sleep(5)
 
     if not os.path.exists(CUDA_BIN):
-        log(f"[!] no binary at {CUDA_BIN}")
+        log(f"[!] no miner binary at {CUDA_BIN} 鈥?build it first (`make` on macOS, "
+            f"nvcc -o prspct_cuda prspct_cuda.cu -lsecp256k1 -lcurl -lpthread` on NVIDIA)")
         sys.exit(1)
 
     for n in range(20):
@@ -364,20 +462,20 @@ def main():
             log(f"[WARN] nonce read failed ({str(e)[:60]}), retrying")
             time.sleep(5)
 
-    cuda = Cuda()
+    cuda = Miner()
     state = None
     last_refresh = 0.0
     counters = {"mined": 0, "fails": 0}
     clock = threading.Lock()
 
     def max_fee(st):
-        return max(int(st.get("gas_price", 0) * 2), Web3.to_wei(1, "gwei"))
+        return max(int(st.get("gas_price", 0) * 2), GWEI)
 
     def send_tx_params(st):
         cuda.send(f"TX {st['tx_nonce']} {max_fee(st)}")
 
     def send_job(st):
-        send_tx_params(st)  # tx params first — so FOUND never fires without them
+        send_tx_params(st)  # tx params first 鈥?so FOUND never fires without them
         seed_hex = st['seed'].hex()
         cuda.send(f"JOB {seed_hex} {ADDR[2:]} {st['target']:064x}")
 
@@ -386,12 +484,11 @@ def main():
     def receipt_worker(txhash):
         ok = False
         try:
-            w3 = w3_for(rpc.url)
-            rc = w3.eth.wait_for_transaction_receipt(txhash, timeout=180)
-            ok = rc["status"] == 1
-            log(f"[TX] status={rc['status']} block={rc['blockNumber']} gasUsed={rc['gasUsed']} {txhash[:18]}…")
+            rc = wait_receipt(txhash, timeout=180)
+            ok = int(rc["status"], 16) == 1 if isinstance(rc["status"], str) else rc["status"] == 1
+            log(f"[TX] status={rc[\x27status\x27]} block={rc[\x27blockNumber\x27]} gasUsed={rc[\x27gasUsed\x27]} {txhash[:18]}")
         except Exception as e:
-            log(f"[TX] receipt wait failed {txhash[:18]}…: {str(e)[:80]}")
+            log(f"[TX] receipt wait failed {txhash[:18]}鈥? {str(e)[:80]}")
         with clock:
             if ok:
                 counters["mined"] += 1
@@ -443,7 +540,7 @@ def main():
             continue
 
         if line is None:
-            log("[!] CUDA process died — restarting")
+            log("[!] miner process died 鈥?restarting")
             cuda.restart()
             if state:
                 send_job(state)
@@ -463,16 +560,16 @@ def main():
                 continue
             lh = local_hash(st["seed"], ADDR, nonce)
             if f"{lh:064x}" != hash_hex:
-                log(f"[!] GPU/CPU hash mismatch — GPU lying, skipping")
+                log(f"[!] GPU/CPU hash mismatch 鈥?GPU lying, skipping")
                 continue
             if lh >= st["target"]:
-                log("[!] hash not below current target — skipping")
+                log("[!] hash not below current target 鈥?skipping")
                 continue
 
             if native_tx["on"]:
-                log(f"[FOUND] nonce={nonce} ({bits_of(lh)} zero bits) — tx already sent from kernel (native)")
+                log(f"[FOUND] nonce={nonce} ({bits_of(lh)} zero bits) 鈥?tx already sent from kernel (native)")
                 continue
-            log(f"[FOUND] nonce={nonce} ({bits_of(lh)} zero bits) — sending (GPU keeps mining)")
+            log(f"[FOUND] nonce={nonce} ({bits_of(lh)} zero bits) 鈥?sending (GPU keeps mining)")
             threading.Thread(target=submit_worker, args=(nonce, dict(st)), daemon=True).start()
         elif line.startswith("SENT"):
             parts = line.split()
@@ -485,8 +582,10 @@ def main():
                 native_tx["on"] = True
             elif "txmode python" in line:
                 native_tx["on"] = False
-            log("[cuda]", line)
+            log("[miner]", line)
 
 
 if __name__ == "__main__":
     main()
+
+

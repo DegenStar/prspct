@@ -1,12 +1,19 @@
 # PRSPCT miner — Python orchestration layer.
 #
+# Everything here is OPTIONAL. prspct_miner.py runs on the standard library
+# alone: it loads .env itself, talks JSON-RPC over urllib, and verifies hashes
+# with the bundled pure-Python keccak. Installing these only adds:
+#
+#   eth-account   the Python submit fallback (not needed in native tx-mode,
+#                 which is the default: the miner binary signs the claim)
+#   web3          same as above, via the usual convenience API
+#   requests      connection pooling/keep-alive for the RPC calls
+#   python-dotenv .env parsing (identical to the built-in loader)
+#
 # web3 7.x requires eth-account>=0.13.6. An older eth-account on the same
 # interpreter breaks startup with:
-#   ImportError: cannot import name 'SignedSetCodeAuthorization' from 'eth_account.datastructures'
-web3>=7.0,<8.0
+#   ImportError: cannot import name 'SignedSetCodeAuthorization' from eth_account.datastructures
 eth-account>=0.13.6
+web3>=7.0,<8.0
 requests>=2.31
-
-# Optional: lets prspct_miner.py auto-load a .env file. Without it you can still
-# run the miner as long as the variables are exported in the shell.
 python-dotenv>=1.0

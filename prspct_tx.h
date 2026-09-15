@@ -1,12 +1,14 @@
-// prspct_tx.h — build, sign (EIP-1559), broadcast tx claim(nonce) directly from CUDA host code.
-// Pure C++17: libsecp256k1 + libcurl. Pure sweat only — value = 0.
-//   g++/nvcc ... -lsecp256k1 -lcurl -lpthread
+// prspct_tx.h — build, sign (EIP-1559), broadcast tx claim(nonce) from the miner host code.
+// Pure C++17: libcurl + (libsecp256k1 or the bundled signer). Pure sweat only — value = 0.
+//   Linux/CUDA: g++/nvcc ... -lsecp256k1 -lcurl -lpthread
+//   macOS:      clang++ ... -lcurl  (uses prspct_secp256k1.h, no libsecp256k1 needed)
 #pragma once
 
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdarg>
 #include <string>
 #include <vector>
 #include <thread>
@@ -14,9 +16,29 @@
 #include <atomic>
 #include <chrono>
 
-#include <secp256k1.h>
-#include <secp256k1_recovery.h>
 #include <curl/curl.h>
+
+// ---------------- secp256k1 backend selection ----------------
+// System libsecp256k1 when it is installed (Linux/CUDA boxes), otherwise the
+// bundled pure-C++ signer so macOS builds work with nothing but the CLT.
+#if defined(PR_FORCE_BUNDLED_SECP256K1)
+  #include "prspct_secp256k1.h"
+#elif defined(PR_FORCE_SYSTEM_SECP256K1)
+  #include <secp256k1.h>
+  #include <secp256k1_recovery.h>
+  #define PR_TX_SYSTEM_SECP 1
+#else
+  #ifdef __has_include
+    #if __has_include(<secp256k1.h>)
+      #include <secp256k1.h>
+      #include <secp256k1_recovery.h>
+      #define PR_TX_SYSTEM_SECP 1
+    #endif
+  #endif
+  #ifndef PR_TX_SYSTEM_SECP
+    #include "prspct_secp256k1.h"
+  #endif
+#endif
 
 namespace pr {
 
@@ -121,7 +143,9 @@ static bytes rlp_list(const std::vector<bytes> &items) {
 
 // ---------------- wallet ----------------
 struct Wallet {
+#ifdef PR_TX_SYSTEM_SECP
   secp256k1_context *ctx = nullptr;
+#endif
   uint8_t key[32];
   bytes address;
   bool ok = false;
@@ -129,6 +153,7 @@ struct Wallet {
   bool init(const std::string &privhex) {
     bytes k; if (!unhex(privhex, k) || k.size() != 32) return false;
     memcpy(key, k.data(), 32);
+#ifdef PR_TX_SYSTEM_SECP
     ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
     if (!secp256k1_ec_seckey_verify(ctx, key)) return false;
     secp256k1_pubkey pub;
@@ -138,14 +163,31 @@ struct Wallet {
     bytes h = keccak256(ser + 1, 64);
     address.assign(h.begin() + 12, h.end());
     ok = true; return true;
+#else
+    ec::PublicKey pub;
+    if (!ec::pubkey_create(key, pub)) return false;
+    uint8_t ser[64];
+    ec::u256_to_bytes(ser, pub.x);
+    ec::u256_to_bytes(ser + 32, pub.y);
+    bytes h = keccak256(ser, 64);          // uncompressed key without the 0x04 prefix
+    address.assign(h.begin() + 12, h.end());
+    ok = true; return true;
+#endif
   }
 
   bool sign(const bytes &hash32, bytes &r, bytes &s, int &v) const {
+#ifdef PR_TX_SYSTEM_SECP
     secp256k1_ecdsa_recoverable_signature sig;
     if (!secp256k1_ecdsa_sign_recoverable(ctx, &sig, hash32.data(), key, nullptr, nullptr)) return false;
     uint8_t compact[64]; int recid = 0;
     secp256k1_ecdsa_recoverable_signature_serialize_compact(ctx, compact, &recid, &sig);
     r.assign(compact, compact + 32); s.assign(compact + 32, compact + 64); v = recid;
+#else
+    if (hash32.size() != 32) return false;
+    uint8_t rb[32], sb[32]; int recid = 0;
+    if (!ec::sign_recoverable(key, hash32.data(), rb, sb, recid)) return false;
+    r.assign(rb, rb + 32); s.assign(sb, sb + 32); v = recid;
+#endif
     while (!r.empty() && r[0] == 0) r.erase(r.begin());
     while (!s.empty() && s[0] == 0) s.erase(s.begin());
     return true;
@@ -206,6 +248,16 @@ static bool build_claim_tx(const Wallet &w, const TxParams &p, uint64_t nonce, b
 static size_t curl_sink(char *ptr, size_t sz, size_t nm, void *ud) { ((std::string*)ud)->append(ptr, sz*nm); return sz*nm; }
 struct SendResult { std::string url; bool ok; std::string msg; double ms; };
 
+// PR_TX_DEBUG=1 dumps curl setup details (handy when a broadcast fails instantly)
+static bool tx_debug() {
+  static const bool on = getenv("PR_TX_DEBUG") != nullptr;
+  return on;
+}
+static void tx_debugf(const char *fmt, ...) {
+  if (!tx_debug()) return;
+  va_list ap; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap);
+}
+
 template <class F>
 static void broadcast(const std::vector<std::string> &urls, const std::string &raw_hex, F on_result) {
   std::vector<std::thread> th;
@@ -215,16 +267,28 @@ static void broadcast(const std::vector<std::string> &urls, const std::string &r
       std::string body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_sendRawTransaction\",\"params\":[\"" + raw_hex + "\"]}";
       std::string resp;
       CURL *c = curl_easy_init();
+      if (!c) {
+        tx_debugf("[tx-debug] curl_easy_init failed (curl_global_init was %d)\n", (int)curl_global_init(CURL_GLOBAL_DEFAULT));
+        on_result(SendResult{u, false, "curl_easy_init failed", 0.0});
+        return;
+      }
       struct curl_slist *hdr = curl_slist_append(nullptr, "Content-Type: application/json");
-      curl_easy_setopt(c, CURLOPT_URL, u.c_str());
-      curl_easy_setopt(c, CURLOPT_POSTFIELDS, body.c_str());
-      curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdr);
-      curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_sink);
-      curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp);
-      curl_easy_setopt(c, CURLOPT_TIMEOUT_MS, 8000L);
-      curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT_MS, 3000L);
-      curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+      CURLcode so[8];
+      so[0] = curl_easy_setopt(c, CURLOPT_URL, u.c_str());
+      so[1] = curl_easy_setopt(c, CURLOPT_POSTFIELDS, body.c_str());
+      so[2] = curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdr);
+      so[3] = curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_sink);
+      so[4] = curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp);
+      so[5] = curl_easy_setopt(c, CURLOPT_TIMEOUT_MS, 8000L);
+      so[6] = curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT_MS, 3000L);
+      so[7] = curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
       CURLcode rc = curl_easy_perform(c);
+      if (rc != CURLE_OK)
+        tx_debugf("[tx-debug] curl %s url=%s rc=%d (%s) setopt=[%d %d %d %d %d %d %d %d] "
+                  "handle=%p body=%zu bytes resp=\"%.120s\"\n",
+                  curl_version(), u.c_str(), (int)rc, curl_easy_strerror(rc),
+                  so[0], so[1], so[2], so[3], so[4], so[5], so[6], so[7],
+                  (void *)c, body.size(), resp.c_str());
       curl_slist_free_all(hdr); curl_easy_cleanup(c);
       double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
       SendResult r{u, false, "", ms};

@@ -35,8 +35,14 @@
 #include <memory>
 #include <cstdarg>
 #include <cctype>
+#ifdef _WIN32
+#include <windows.h>
+#include <conio.h>
+#include <io.h>
+#else
 #include <sys/select.h>
 #include <unistd.h>
+#endif
 #include <cuda_runtime.h>
 
 static std::mutex g_out;
@@ -263,9 +269,19 @@ static bool build_job(const std::string &seed, const std::string &sender, const 
 }
 
 static bool stdin_ready() {
+#ifdef _WIN32
+  HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+  if (h == INVALID_HANDLE_VALUE || h == nullptr) return false;
+  if (GetFileType(h) == FILE_TYPE_PIPE) {
+    DWORD avail = 0;
+    return PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr) && avail > 0;
+  }
+  return _kbhit() != 0;
+#else
   fd_set fds; FD_ZERO(&fds); FD_SET(0, &fds);
   struct timeval tv = {0, 0};
   return select(1, &fds, nullptr, nullptr, &tv) > 0;
+#endif
 }
 
 int main() {

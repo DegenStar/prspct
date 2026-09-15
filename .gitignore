@@ -6,10 +6,16 @@ __pycache__/
 .env.*
 !.env.example
 
-# compiled CUDA miner
+# compiled miners
 prspct_cuda
+prspct_local
 *.o
 *.so
+
+# test artifacts
+tests/crypto_selftest
+tests/vectors.txt
+tests/err.txt
 
 .venv/
 venv/
