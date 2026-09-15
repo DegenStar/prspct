@@ -140,7 +140,7 @@ MINER_BIN=prspct/prspct_cpu.py
 以管理员身份运行 PowerShell:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\install.ps
+powershell -ExecutionPolicy Bypass -File .\install.ps1
 python .\prspct_miner.py
 ```
 
